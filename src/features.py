@@ -256,17 +256,14 @@ def compute_plv_epoch(epoch_data, sfreq):
     for b_idx, (_, (fmin, fmax)) in enumerate(FREQ_BANDS.items()):
         filtered = _bandpass(epoch_data, sfreq, fmin, fmax)
         analytic = hilbert(filtered, axis=-1)
-        phases = np.angle(analytic)
+        phases = np.angle(analytic)  # (n_ch, n_times)
 
-        # PLV computation for all channel pairs
-        for i in range(n_ch):
-            for j in range(i + 1, n_ch):
-                phase_diff = phases[i] - phases[j]
-                plv = np.abs(np.mean(np.exp(1j * phase_diff)))
-                plv_all[i, j, b_idx] = plv
-                plv_all[j, i, b_idx] = plv
-
-        np.fill_diagonal(plv_all[:, :, b_idx], 1.0)
+        # Fully vectorized PLV: compute all pairs at once
+        # phase_diff[i,j,:] = phases[i,:] - phases[j,:]
+        phase_diff = phases[:, np.newaxis, :] - phases[np.newaxis, :, :]  # (n_ch, n_ch, n_times)
+        plv_matrix = np.abs(np.mean(np.exp(1j * phase_diff), axis=2))    # (n_ch, n_ch)
+        np.fill_diagonal(plv_matrix, 1.0)
+        plv_all[:, :, b_idx] = plv_matrix
 
     # Average across bands
     plv_avg = np.mean(plv_all, axis=2)
