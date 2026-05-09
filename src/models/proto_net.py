@@ -94,28 +94,34 @@ class GNNProtoNet(nn.Module):
             prototypes.append(embeddings[mask].mean(dim=0))
         return torch.stack(prototypes)
 
-    def calibrate_prototypes(self, prototypes, cal_embeddings, cal_labels):
+    def calibrate_prototypes(self, prototypes, cal_embeddings, cal_labels=None):
         """
         Calibrate prototypes using test-subject calibration samples.
 
-        calibrated = alpha * original + (1 - alpha) * subject_mean
-
-        Parameters
-        ----------
-        prototypes : (n_classes, EMBEDDING_DIM)
-        cal_embeddings : (n_cal, EMBEDDING_DIM)
-        cal_labels : (n_cal,)
-
-        Returns
-        -------
-        calibrated : (n_classes, EMBEDDING_DIM)
+        Mode is determined by `cal_labels`:
+          - If `cal_labels` is None: UNLABELED mean-centering. Compute one
+            joint mean across all cal_embeddings and shift every prototype
+            by the same convex combination. This is a domain-adaptation
+            centering trick that uses no labels from the test subject.
+          - If `cal_labels` is provided: legacy label-aware mode. Shifts
+            only the prototype matching each present class. Requires the
+            test subject's true label and is therefore supervised
+            personalisation rather than unlabeled adaptation.
         """
         calibrated = prototypes.clone()
+
+        if cal_labels is None:
+            # Unlabeled mean-centering: shift all prototypes by the same delta
+            cal_mean = cal_embeddings.mean(dim=0)
+            for i in range(calibrated.shape[0]):
+                calibrated[i] = (self.alpha * prototypes[i] +
+                                 (1 - self.alpha) * cal_mean)
+            return calibrated
+
+        # Label-aware mode (legacy)
         n_classes = prototypes.shape[0]
         cal_classes = torch.unique(cal_labels)
-
         for c in sorted(cal_classes.tolist()):
-            # Map class value to prototype index (prototypes ordered as [0, 1, ...])
             proto_idx = int(c)
             if proto_idx >= n_classes:
                 continue
@@ -171,8 +177,9 @@ class GNNProtoNet(nn.Module):
         # Prototypes
         prototypes = self.compute_prototypes(support_emb, support_labels)
 
-        # Calibrate if calibration data provided
-        if cal_graphs is not None and cal_labels is not None:
+        # Calibrate if calibration graphs provided (labels optional;
+        # if None, calibrate_prototypes does unlabeled mean-centering).
+        if cal_graphs is not None:
             cal_emb = self.encode(cal_graphs)
             prototypes = self.calibrate_prototypes(prototypes, cal_emb, cal_labels)
 

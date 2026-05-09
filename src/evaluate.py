@@ -17,7 +17,7 @@ from train import train_one_fold, create_fresh_model, move_graphs_to_device
 
 
 def evaluate_subject(model, test_subject, train_subjects, k_shot=5,
-                     calibrate=True):
+                     calibrate=True, calibration_mode='unlabeled'):
     """
     Evaluate model on a single held-out subject.
 
@@ -27,7 +27,11 @@ def evaluate_subject(model, test_subject, train_subjects, k_shot=5,
     test_subject : Subject
     train_subjects : list of Subject
     k_shot : int — calibration samples from test subject
-    calibrate : bool
+    calibrate : bool — master switch
+    calibration_mode : str — one of:
+        'none'      — no calibration even if calibrate=True
+        'unlabeled' — domain-adaptation mean-centering (no test labels used)
+        'labeled'   — legacy: uses test subject's true label (supervised)
 
     Returns
     -------
@@ -77,16 +81,27 @@ def evaluate_subject(model, test_subject, train_subjects, k_shot=5,
     support_graphs = move_graphs_to_device(support_graphs, DEVICE)
     query_graphs_list = move_graphs_to_device(query_graphs_list, DEVICE)
 
+    use_cal = calibrate and calibration_mode != 'none'
+
     with torch.no_grad():
-        if calibrate:
-            cal_graphs = move_graphs_to_device(cal_graphs, DEVICE)
-            cal_labels = torch.tensor(
-                [test_subject.label] * k_shot, dtype=torch.long
-            ).to(DEVICE)
-            log_probs, predictions = model(
-                support_graphs, support_labels, query_graphs_list,
-                cal_graphs, cal_labels,
-            )
+        if use_cal:
+            cal_graphs_dev = move_graphs_to_device(cal_graphs, DEVICE)
+            if calibration_mode == 'labeled':
+                cal_labels_t = torch.tensor(
+                    [test_subject.label] * k_shot, dtype=torch.long
+                ).to(DEVICE)
+                log_probs, predictions = model(
+                    support_graphs, support_labels, query_graphs_list,
+                    cal_graphs_dev, cal_labels_t,
+                )
+            elif calibration_mode == 'unlabeled':
+                # Pass cal graphs with None labels -> unlabeled mean-centering
+                log_probs, predictions = model(
+                    support_graphs, support_labels, query_graphs_list,
+                    cal_graphs_dev, None,
+                )
+            else:
+                raise ValueError(f"Unknown calibration_mode: {calibration_mode}")
         else:
             log_probs, predictions = model(
                 support_graphs, support_labels, query_graphs_list,
@@ -217,6 +232,7 @@ def loso_evaluation(subjects, k_shot=5, calibrate=True,
 
 
 def cross_dataset_evaluation(subjects, k_shot=5, calibrate=True,
+                              calibration_mode='unlabeled',
                               encoder_type=ENCODER_TYPE,
                               n_episodes=N_EPISODES_TRAIN, n_epochs=N_TRAIN_EPOCHS):
     """
@@ -263,17 +279,27 @@ def cross_dataset_evaluation(subjects, k_shot=5, calibrate=True,
         # Evaluate on each test subject
         all_y_true, all_y_pred, all_y_scores = [], [], []
         per_subject_acc = []
+        # Subject-level prediction via majority vote across query epochs
+        subj_true, subj_pred, subj_score = [], [], []
 
         for test_subj in test_subjs:
             acc, y_true, y_pred, y_scores = evaluate_subject(
                 model, test_subj, train_subjs,
                 k_shot=k_shot, calibrate=calibrate,
+                calibration_mode=calibration_mode,
             )
             all_y_true.extend(y_true)
             all_y_pred.extend(y_pred)
             all_y_scores.extend(y_scores)
-            if y_true:  # Only include subjects with valid predictions
+            if y_true:
                 per_subject_acc.append(acc)
+                # Subject-level: majority vote on epoch predictions
+                pred_label = 1 if sum(y_pred) > len(y_pred) / 2 else 0
+                # Subject-level score = mean prob of class 1 across epochs
+                mean_score = float(np.mean(y_scores)) if y_scores else 0.5
+                subj_true.append(test_subj.label)
+                subj_pred.append(pred_label)
+                subj_score.append(mean_score)
 
             label_str = 'PD' if test_subj.label == 1 else 'HC'
             print(f"  {test_subj.subject_id} ({label_str}) -> Acc: {acc:.4f}")
@@ -282,6 +308,17 @@ def cross_dataset_evaluation(subjects, k_shot=5, calibrate=True,
         fold_metrics['train_datasets'] = train_ds
         fold_metrics['test_dataset'] = test_ds
         fold_metrics['mean_subject_accuracy'] = float(np.mean(per_subject_acc))
+        # Subject-level metrics (majority vote across epochs)
+        if subj_true:
+            subj_metrics = compute_metrics(subj_true, subj_pred, subj_score)
+            fold_metrics['subject_level_accuracy'] = subj_metrics.get('accuracy', 0)
+            fold_metrics['subject_level_f1'] = subj_metrics.get('f1_score', 0)
+            fold_metrics['subject_level_auc'] = subj_metrics.get('auc_roc', 0)
+            fold_metrics['subject_level_sensitivity'] = subj_metrics.get('sensitivity', 0)
+            fold_metrics['subject_level_specificity'] = subj_metrics.get('specificity', 0)
+            fold_metrics['n_subjects_correct'] = int(sum(
+                1 for t, p in zip(subj_true, subj_pred) if t == p))
+            fold_metrics['n_subjects_total'] = len(subj_true)
         fold_results.append(fold_metrics)
 
         print(f"  Fold Accuracy: {fold_metrics.get('accuracy', 0):.4f}")
@@ -291,24 +328,31 @@ def cross_dataset_evaluation(subjects, k_shot=5, calibrate=True,
         avg_acc = np.mean([f['accuracy'] for f in fold_results])
         avg_f1 = np.mean([f['f1_score'] for f in fold_results])
         avg_auc = np.mean([f.get('auc_roc', 0) for f in fold_results])
+        avg_subj_acc = np.mean([f.get('subject_level_accuracy', 0) for f in fold_results])
+        avg_subj_auc = np.mean([f.get('subject_level_auc', 0) for f in fold_results])
+        avg_subj_f1 = np.mean([f.get('subject_level_f1', 0) for f in fold_results])
     else:
         avg_acc = avg_f1 = avg_auc = 0
+        avg_subj_acc = avg_subj_auc = avg_subj_f1 = 0
 
     results = {
         'folds': fold_results,
         'mean_accuracy': float(avg_acc),
         'mean_f1': float(avg_f1),
         'mean_auc': float(avg_auc),
+        'mean_subject_level_accuracy': float(avg_subj_acc),
+        'mean_subject_level_auc': float(avg_subj_auc),
+        'mean_subject_level_f1': float(avg_subj_f1),
     }
 
     print(f"\n{'='*60}")
     print(f"CROSS-DATASET RESULTS (K={k_shot})")
     print(f"{'='*60}")
-    print(f"  Mean Accuracy: {avg_acc:.4f}")
-    print(f"  Mean F1:       {avg_f1:.4f}")
-    print(f"  Mean AUC-ROC:  {avg_auc:.4f}")
+    print(f"  Epoch-level Accuracy: {avg_acc:.4f}, AUC: {avg_auc:.4f}")
+    print(f"  SUBJECT-LEVEL Accuracy: {avg_subj_acc:.4f}, AUC: {avg_subj_auc:.4f}, F1: {avg_subj_f1:.4f}")
     for f in fold_results:
         print(f"  {'+'.join(f['train_datasets'])} -> {f['test_dataset']}: "
-              f"Acc={f['accuracy']:.4f}")
+              f"epoch={f['accuracy']:.4f} subj={f.get('subject_level_accuracy', 0):.4f} "
+              f"({f.get('n_subjects_correct', 0)}/{f.get('n_subjects_total', 0)})")
 
     return results

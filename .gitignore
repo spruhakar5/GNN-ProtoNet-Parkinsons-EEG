@@ -14,3 +14,8 @@ build/
 .venv/
 env/
 venv/
+
+# Local-only archives, screenshots, and full paper PDF (released separately)
+/*.zip
+/image*.jpeg
+/Parkinson*.pdf

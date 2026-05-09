@@ -136,13 +136,16 @@ def _sample_entropy(sig, m=2, r_factor=0.2):
         return 0.0
 
     def _count_matches(template_len):
-        templates = np.array([sig[i:i + template_len] for i in range(N - template_len)])
-        n = len(templates)
-        count = 0
-        for i in range(n):
-            diffs = np.max(np.abs(templates[i] - templates[i+1:]), axis=1)
-            count += np.sum(diffs < r)
-        return count
+        # Fully vectorized: build templates then compute pairwise max-diff
+        n_templates = N - template_len
+        if n_templates < 2:
+            return 0
+        templates = np.lib.stride_tricks.sliding_window_view(sig, template_len)[:n_templates]
+        # Compute max pairwise distance via broadcasting (upper triangle only)
+        diffs = np.abs(templates[:, np.newaxis, :] - templates[np.newaxis, :, :]).max(axis=2)
+        # Count pairs where distance < r, excluding diagonal and lower triangle
+        mask = np.triu(np.ones((n_templates, n_templates), dtype=bool), k=1)
+        return int(np.sum((diffs < r) & mask))
 
     A = _count_matches(m + 1)
     B = _count_matches(m)
